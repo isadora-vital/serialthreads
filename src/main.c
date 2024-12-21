@@ -1,95 +1,62 @@
-/*
-*   CMAS AR
-*   dado transmitido: até 7 caracteres
-*   estruturando o problema:
-        lixo: 0110 0110
-        SYN: 0001 0110
-        STX: 0000 0010
-        ID: 11011 e N: definido pela entrada
-        DADO: inserido pelo usuário
-        ETX: 0000 0011
-*
-*/
-
 #include <stdio.h>
 #include <stddef.h>
 #include <string.h>
-
 #include <zephyr/toolchain.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/drivers/gpio.h>
-
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
 
+//DEFINIÇÕES ----------------------------------------------------------------------
 /* 1000 msec = 1 sec */
-#define SLEEP_TIME_MS 1000
 #define STACKSIZE 1024
 #define PRIORITY 0
-
-//FIFO e UART -----------------------------------------------------------------
-#define limiteFIFO 1000
-
-char tx_buf[MSG_SIZE];
-
-K_FIFO_DEFINE(entradaFIFO);
-K_FIFO_DEFINE(saidaFIFO);
-
-int elementosFIFO_IN = 0;
-int elementosFIFO_OUT = 0;
 
 // change this to any other UART peripheral if desired 
 #define UART_DEVICE_NODE DT_CHOSEN(zephyr_shell_uart)
 
-#define MSG_SIZE 32 //tem que
+#define MSG_SIZE 9
+
+// queue to store up to 10 messages (aligned to 4-byte boundary) 
+K_MSGQ_DEFINE(uart_msgq, MSG_SIZE, 100, 4);
 
 static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
 
-// recebe buffer usado no retorno da chamada UART ISR
+// receive buffer used in UART ISR callback
 static char rx_buf[MSG_SIZE];
 static int rx_buf_pos;
 
 //acesso ao gpiob
 const struct device *stx = DEVICE_DT_GET(DT_NODELABEL(gpiob));
 
-//precisaremos disso para printar
-void print_uart(char *buf)
-{
-	int msg_len = strlen(buf);
-
-	for (int i = 0; i < msg_len; i++) {
-		uart_poll_out(uart_dev, buf[i]);
-	}
-}
-
-//DEFINIÇÕES INICIAIS ---------------------------------------------------------------------------
-//tempo timer
 int tempoT = 5000;
-
+//MSGQ ----------------------------------------------------------------------
 struct pacote {
     //até 12 bytes
-    uint8_t lixo;
-    uint8_t syn;
-    uint8_t stx;
-    uint8_t idN;
-    char dado[7];
-    uint8_t etx;
+    uint8_t lixo; //1 byte
+    uint8_t syn; //1 byte
+    uint8_t stx; //1 byte
+    uint8_t idN; //1 byte
+    char dado[8]; //até 7 bytes
+    uint8_t etx; //1 byte
 };
 
-int aux, tamanhoDado, i = 0, pegarFifo = 0;
-struct data_item_t {
-    void *fifo_reserved;   /* 1st word reserved for use by FIFO */
-    char value[100];
-};
-//---------------------------------------------------------------------------
-// Lê caracteres da UART até a linha de final ser detectada. 
-// Insere os dados na FIFO.
-void serial_cb(const struct device *dev, void *user_data, struct k_timer *timer_id)
+K_MSGQ_DEFINE(msgqIn, sizeof(struct pacote), 100, 4);
+
+struct pacote segmento;
+
+int elementosFifoIn = 0;
+
+//DEFINIÇÕES ----------------------------------------------------------------------
+/*
+ * Read characters from UART until line end is detected. Afterwards push the
+ * data to the message queue.
+ */
+void serial_cb(const struct device *dev, void *user_data)
 {
-    //envio de todos os dados
 	uint8_t c, id, N;
-    char dadoTemp = 0;
+    char dadoTemp[8] = {0}; //7 caracteres + "/0"
 
 	if (!uart_irq_update(uart_dev)) {
 		return;
@@ -99,19 +66,18 @@ void serial_cb(const struct device *dev, void *user_data, struct k_timer *timer_
 		return;
 	}
 
-    static struct pacote segmento;
-    segmento.lixo = 0b01100110; //é o U
+	segmento.lixo = 0b01100110; //é o U
     segmento.syn = 0b00010110;
     segmento.stx = 0b00000010;
     id = 0b11011; //5 bits iniciais
-	//lê até a FIFO encher
+
+	/* read until FIFO empty */
 	while (uart_fifo_read(uart_dev, &c, 1) == 1) {
 		if ((c == '\n' || c == '\r') && rx_buf_pos > 0) {
 			/* terminate string */
 			rx_buf[rx_buf_pos] = '\0';
 
-            dadoTemp = rx_buf;
-            dadoTemp = dadoTemp << 1;
+            strncpy(dadoTemp, rx_buf, sizeof(dadoTemp) - 1);
 
 			/* reset the buffer (it was copied to the msgq) */
 			rx_buf_pos = 0;
@@ -120,63 +86,45 @@ void serial_cb(const struct device *dev, void *user_data, struct k_timer *timer_
 		}
 		/* else: characters beyond buffer size are dropped */
 	}
+	
     N = strlen(dadoTemp);
+
+	//ajusta o dado de entrada
     segmento.idN = (id << 3) | (N & 0x07);
-    segmento.dado = dadoTemp;
+    strncpy(segmento.dado, dadoTemp, sizeof(segmento.dado) - 1);
+    segmento.dado[sizeof(segmento.dado) - 1] = '\0'; //termina bonitinho o array
     segmento.etx = 0b00000011;
 
-    struct pacote *novo_segmento = k_malloc(sizeof(struct pacote));
-    // Usamos k_malloc porque colocar diretamente o segmento na FIFO
-    //indica colocar seu ponteiro na fila. Ao inserir um novo elemento
-    //segmento na FIFO o primeiro será alterado e todos serão iguais.
-
-    //O k_malloc isola os dados, evitando que sejam sobrescritos.
-
-    /* sugestão do chatGPT para caso em que o segmento é nulo.
-    Isso não ocorrerá porque é uma callback que só é chamada 
-    quando tem dado inserido, mas tá aqui:
-    if (novo_segmento == NULL) {
-    // Tratamento de erro: heap sem memória suficiente
-    printk("Erro: memória insuficiente para alocação!\n");
-    return;
-    } */
-
-    memcpy(novo_segmento, &segmento, sizeof(struct pacote));
-
-    k_fifo_put(&entradaFIFO, &novo_segmento); //envia 1 pacote completo p/fifo
-    elementosFIFO_IN++;
+	k_msgq_put(&msgqIn, &segmento, K_NO_WAIT);
+	/* if queue is full, message is silently dropped */
+	k_msgq_put(&uart_msgq, &rx_buf, K_NO_WAIT);
+	
+    elementosFifoIn++;
 }
 
 /*
-- Para pegar o dado e liberar a memória depois: 
-struct pacote *recebido = k_fifo_get(&entradaFIFO, K_FOREVER);
+ * Print a null-terminated string character by character to the UART interface
+ */
 
-if (recebido) {
-    // Acessar os campos do segmento recebido
-    printk("Lixo: 0x%x\n", recebido->lixo);
-    printk("SYN: 0x%x\n", recebido->syn);
+//PRECISAREMOS DISSO PARA PRINTAR DEPOIS
+void print_uart(char *buf)
+{
+	int msg_len = strlen(buf);
 
-    // Liberar a memória alocada
-    k_free(recebido);
-} 
-*/
-//---------------------------------------------------------------------------
-K_TIMER_DEFINE(timerTX, TX, NULL);
+	for (int i = 0; i < msg_len; i++) {
+		uart_poll_out(uart_dev, buf[i]);
+	}
+}
 
-//---------------------------------------------------------------------------
-int main (void){
-    gpio_pin_configure(stx, 0x3, GPIO_OUTPUT_ACTIVE); //0x3 é o pino
-
-    //confere erro na UART
+int main(void){
 	if (!device_is_ready(uart_dev)) {
 		printk("UART device not found!");
 		return 0;
 	}
 
-	//configura a interrupção e callback para receber dados
+	/* configure interrupt and callback to receive data */
 	int ret = uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL);
 
-    //mais erros na UART
 	if (ret < 0) {
 		if (ret == -ENOTSUP) {
 			printk("Interrupt-driven UART API support not enabled\n");
@@ -187,100 +135,60 @@ int main (void){
 		}
 		return 0;
 	}
-
 	uart_irq_rx_enable(uart_dev);
 
-	print_uart("Hola, o codigo esta comecando.\r\n");
-	print_uart("Escreva algo de ate 7 caracteres:\r\n");
+	printf("Ola!\r\n");
+	printf("Insira ate 7 caracteres e aperte enter:\r\n");
 
-	//espera indefinidamente por input do usuário
-	while (1) {
-	
-    }
-    return 0;
+    gpio_pin_configure(stx, 0x3, GPIO_OUTPUT_ACTIVE); //0x3 é o pino
 }
 
-void IN(void){
-    /* teclado */
+//TIMER -----------------------------------------------------------------------------------------
+void IN(struct k_timer *timer_id){
+	char tx_buf[MSG_SIZE];
+	char tx_buf2[MSG_SIZE];
+	printf("Elementos no msgq: %d\n", elementosFifoIn);
+
+	/* indefinitely wait for input from the user */
+	if (k_msgq_get(&uart_msgq, &tx_buf, K_FOREVER) == 0 && k_msgq_get(&msgqIn, &tx_buf2, K_FOREVER) == 0) {
+		elementosFifoIn--;
+		printf("Echo1: ");
+		print_uart(tx_buf);
+		print_uart("\r\n");
+
+		printf("Echo2 (bits): ");
+	    uint8_t *segmento_pont = (uint8_t *)&segmento; // ponteiro para os dados do struct
+
+		// Tamanho total do struct em bytes
+		size_t segmento_tam = sizeof(segmento);
+
+		for (size_t byte = 0; byte < (segmento_tam); byte++) {
+			uint8_t byteAtual = segmento_pont[byte];
+			
+			// Processa cada bit no byte (do MSB para o LSB)
+			for (int bit = 7; bit >= 0; bit--) {
+				int bitEnvio = (byteAtual >> bit) & 0x01; // Isola o bit atual
+				printk("%d", bitEnvio);                      // Imprime o bit no console
+        		gpio_pin_set(stx, 0x3, bitEnvio); //envia bit pelo GPIO
+			}
+			printk(" "); // Espaço entre bytes para melhor visualização
+		}
+		print_uart("\r\n");
+		printf("Elementos no msgq: %d\n", elementosFifoIn);
+	}
+	return;
+}
+
+K_TIMER_DEFINE(timerTX, IN, NULL);
+
+void TX(void){
     k_timer_start(&timerTX, K_MSEC(tempoT), K_MSEC(tempoT));
     //Ji: pegar o que está na fifo e mandar para a TX
     // eu to perdido socorro 
 }
 
-void TX(void){
-    // transmissão de informação 
-    static struct pacote *transmitindo;
-
-    if(pegarFifo <= ())
-    transmitindo = k_fifo_get(&entradaFIFO, K_FOREVER);
-    
-    if(tamanhoDado != 0){
-        if(pegarFifo <= (8*(5 + tamanhoDado))){
-            pegarFifo++;
-            transmitindo = transmitindo & 0b1;
-            gpio_pin_set(stx, 0x3, aux); 
-            transmitindo = transmitindo >> 1;
-		    printk("\n RX1: %s \n", rx1_data->value);
-        }
-        for(int i = 0; i < (8*(5 + tamanhoDado)); i++){
-            
-	    }
-	    printk("\nItens na fila: %d\n", elementosFIFO);
-    }
-}
-/*
-static struct pacote *transmitindo;
-transmitindo = k_fifo_get(&entradaFIFO, K_FOREVER);
-
-if(tamanhoDado != 0){
-        for(int i = 0; i < (8*(5 + tamanhoDado)); i++){
-            aux = transmitindo & 0b1;
-            gpio_pin_set(stx, 0x3, aux); 
-            transmitindo = transmitindo >> 1;
-		    printk("\n RX1: %s \n", rx1_data->value);
-	    }
-	    printk("\nItens na fila: %d\n", elementosFIFO);
-    }
-*/
-void RX(void){
-    /* recepção de sinal */
-    //se detectar o sync, pega o mutex
-    //quando pegar o mutex o TX não envia nada
-
-    //confere se é válida a recepção ou não
-    struct data_item_t  *rx1_data;
-
-    while(1){
-        rx1_data = k_fifo_get(&my_fifo, K_FOREVER);
-
-        if(rx1_data == NULL){ //ou se elementosFIFO == 0;
-            printk("\n Lista vazia.\n");
-        } else{
-            printf("\n RX1: %s \n", rx1_data->value);
-            elementosFIFO--;
-        }
-        printf("\nItens na fila: %d\n", elementosFIFO);
-
-        k_msleep(SLEEP_TIME_MS);
-    }
-}
-
-void OUT(void){
-    // printa informação VÁLIDA recebida 
-    // espera o tempo todo pelo input do usuário 
-	while (k_fifo_get(&saidaFIFO, &tx_buf, K_FOREVER) == 0) {
-		print_uart("Info: ");
-		print_uart(tx_buf);
-		print_uart("\n");
-	}
-}
-
-/*define threads*/
+//THREADS ----------------------------------------------------------------------------------------
 K_THREAD_DEFINE(tx_id, STACKSIZE, TX, NULL, NULL, NULL, PRIORITY, 0, 0);
 //transmissão 
-K_THREAD_DEFINE(rx_id, STACKSIZE, RX, NULL, NULL, NULL, PRIORITY, 0, 0);
+//K_THREAD_DEFINE(rx_id, STACKSIZE, RX, NULL, NULL, NULL, PRIORITY, 0, 0);
 //recepção
-K_THREAD_DEFINE(in_id, STACKSIZE, IN, NULL, NULL, NULL, PRIORITY, 0, 0);
-//escrita -> entrada
-K_THREAD_DEFINE(out_id, STACKSIZE, OUT, NULL, NULL, NULL, PRIORITY, 0, 0);
-//leitura -> saída
